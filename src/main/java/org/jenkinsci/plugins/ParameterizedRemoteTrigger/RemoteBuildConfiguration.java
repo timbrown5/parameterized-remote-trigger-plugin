@@ -5,7 +5,6 @@ import hudson.AbortException;
 import hudson.FilePath;
 
 import hudson.EnvVars;
-
 import hudson.Launcher;
 import hudson.Extension;
 import hudson.util.CopyOnWriteList;
@@ -16,7 +15,6 @@ import hudson.model.AbstractProject;
 import hudson.tasks.Builder;
 import hudson.tasks.BuildStepDescriptor;
 import net.sf.json.JSONObject;
-import net.sf.json.JSONArray;
 import net.sf.json.JSONSerializer;
 //import net.sf.json.
 //import net.sf.json.
@@ -40,6 +38,7 @@ import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 
 import org.apache.commons.codec.binary.Base64;
@@ -57,6 +56,7 @@ public class RemoteBuildConfiguration extends Builder {
 
     private final boolean         shouldNotFailBuild;
     private final int             pollInterval;
+    private final int             connectionRetryLimit;
     private final boolean         preventRemoteBuildQueue;
     private final boolean         blockBuildUntilComplete;
 
@@ -68,7 +68,6 @@ public class RemoteBuildConfiguration extends Builder {
 
     private static String         paramerizedBuildUrl = "/buildWithParameters";
     private static String         normalBuildUrl      = "/build";
-    //private static String         normalBuildUrl      = "/buildWithParameters";
     private static String         buildTokenRootUrl   = "/buildByToken";
 
     private final boolean         overrideAuth;
@@ -92,6 +91,7 @@ public class RemoteBuildConfiguration extends Builder {
         this.preventRemoteBuildQueue = preventRemoteBuildQueue;
         this.blockBuildUntilComplete = blockBuildUntilComplete;
         this.pollInterval = pollInterval;
+        this.connectionRetryLimit = 5;
 
         if (overrideAuth != null && overrideAuth.has("auth")) {
             this.overrideAuth = true;
@@ -131,7 +131,8 @@ public class RemoteBuildConfiguration extends Builder {
         this.pollInterval = pollInterval;
         this.overrideAuth = false;
         this.auth.replaceBy(new Auth(null));
-
+        this.connectionRetryLimit = 5;
+        
         this.loadParamsFromFile = false;
 
         // split the parameter-string into an array based on the new-line character
@@ -446,7 +447,18 @@ public class RemoteBuildConfiguration extends Builder {
             throw new AbortException(e.getMessage());
         }
     }
-
+    
+  
+    /**
+     * Performs the trigger remote job action. This jobs sets the following Environment Variables (the names are copied from Parameterized Trigger Plugin (see getEnvVarsMap).
+     * @param build
+     * @param launcher
+     * @param listener
+     * @return
+     * @throws InterruptedException
+     * @throws IOException
+     * @throws IllegalArgumentException 
+     */
     @Override
     public boolean perform(AbstractBuild build, Launcher launcher, BuildListener listener) throws InterruptedException,
             IOException, IllegalArgumentException {
@@ -496,10 +508,7 @@ public class RemoteBuildConfiguration extends Builder {
                 // if building is true then the build is running
                 // if result is null the build hasn't finished - but might not have started running.
                 while (preCheckResponse.getBoolean("building") == true || preCheckResponse.getString("result") == null) {
-                    listener.getLogger().println("Remote build is currently running - waiting for it to finish.");
-                    preCheckResponse = sendHTTPCall(preCheckUrlString, "POST", build, listener);
-                    listener.getLogger().println("Waiting for " + this.pollInterval + " seconds until next retry.");
-
+                    listener.getLogger().println("Remote build is currently running. Waiting for it to finish - "+ this.pollInterval + " seconds until next retry.");
                     // Sleep for 'pollInterval' seconds.
                     // Sleep takes miliseconds so need to convert this.pollInterval to milisecopnds (x 1000)
                     try {
@@ -507,6 +516,7 @@ public class RemoteBuildConfiguration extends Builder {
                     } catch (InterruptedException e) {
                         this.failBuild(e, listener);
                     }
+                    preCheckResponse = sendHTTPCall(preCheckUrlString, "POST", build, listener);
                 }
                 listener.getLogger().println("Remote job remote job " + jobName + " is not currenlty building.");    
             } else {
@@ -569,9 +579,8 @@ public class RemoteBuildConfiguration extends Builder {
             buildStatusStr = getBuildStatus(jobLocation, build, listener);
 
             while (buildStatusStr.equals("not started")) {
-                listener.getLogger().println("Waiting for remote build to start.");
-                listener.getLogger().println("Waiting for " + this.pollInterval + " seconds until next poll.");
-                buildStatusStr = getBuildStatus(jobLocation, build, listener);
+                listener.getLogger().println("Waiting for remote build to start - " + this.pollInterval + " seconds until next poll.");
+
                 // Sleep for 'pollInterval' seconds.
                 // Sleep takes miliseconds so need to convert this.pollInterval to milisecopnds (x 1000)
                 try {
@@ -580,13 +589,13 @@ public class RemoteBuildConfiguration extends Builder {
                 } catch (InterruptedException e) {
                     this.failBuild(e, listener);
                 }
+                buildStatusStr = getBuildStatus(jobLocation, build, listener);
             }
 
             listener.getLogger().println("Remote build started!");
             while (buildStatusStr.equals("running")) {
-                listener.getLogger().println("Waiting for remote build to finish.");
-                listener.getLogger().println("Waiting for " + this.pollInterval + " seconds until next poll.");
-                buildStatusStr = getBuildStatus(jobLocation, build, listener);
+                listener.getLogger().println("Waiting for remote build to finish - " + this.pollInterval + " seconds until next poll.");
+                
                 // Sleep for 'pollInterval' seconds.
                 // Sleep takes miliseconds so need to convert this.pollInterval to milisecopnds (x 1000)
                 try {
@@ -595,6 +604,7 @@ public class RemoteBuildConfiguration extends Builder {
                 } catch (InterruptedException e) {
                     this.failBuild(e, listener);
                 }
+                buildStatusStr = getBuildStatus(jobLocation, build, listener);
             }
             listener.getLogger().println("Remote build finished with status " + buildStatusStr + ".");
 
@@ -607,8 +617,94 @@ public class RemoteBuildConfiguration extends Builder {
         } else {
             listener.getLogger().println("Not blocking local job until remote job completes - fire and forget.");
         }
-
+        
+        
+        //Create EnvVars hash and use this to set EnvVars for job.
+        EnvVars buildEnvVars = build.getEnvironment(listener);
+        HashMap<String, String> remoteBuildEnvVars = getEnvVarsMap(listener, buildEnvVars, jobName, nextBuildNumber, buildStatusStr);
+        
+        //Set the new build variables map
+        build.addAction(new RemoteBuildEnvInjectAction(remoteBuildEnvVars));
+        
         return true;
+    }
+    
+    /**
+     * Creates a HashMap of Environment Variables to set for the Job, as defined in Parameterized Build plugin:
+     *  - LAST_TRIGGERED_JOB_NAME="Last project started"
+     *  - TRIGGERED_BUILD_NUMBER_<project name>="Last build number triggered"
+     *  - TRIGGERED_JOB_NAMES="Comma separated list of all triggered projects"
+     *  - TRIGGERED_BUILD_NUMBERS_<project name>="Comma separated list of build numbers triggered"
+     *  - TRIGGERED_BUILD_RESULT_<project name>="Last triggered build result of project"
+     *  - TRIGGERED_BUILD_RESULT_<project name>_RUN_<build number>="Result of triggered build for build number"
+     *  - TRIGGERED_BUILD_RUN_COUNT_project name>="Number of builds triggered for the project"
+     * @param env
+     * @param jobName
+     * @param buildNum
+     * @param buildStatusStr
+     * @return HasMap<String,String> A HashMap of Environment Variables.
+     */
+    public HashMap<String, String> getEnvVarsMap(BuildListener listener, EnvVars env, String jobName, int nextBuildNumber, String buildStatusStr ) {
+        
+        HashMap<String, String> remoteBuildEnvVars = new HashMap<String, String>();
+        //replace any non-alpha numeric character in job name with an underscore.
+        String sanitisedJobName = jobName.replaceAll("[^a-zA-Z0-9]+", "_");
+        String buildNumberStr = Integer.toString(nextBuildNumber);
+        
+        //Set EnvVar "LAST_TRIGGERED_JOB_NAME" to a sanitized sanitisedJobName.
+        remoteBuildEnvVars.put("LAST_TRIGGERED_JOB_NAME", jobName );
+
+        //Set EnvVar "TRIGGERED_BUILD_NUMBER_<project name>" to stringified nextBuildNumber.
+        remoteBuildEnvVars.put("TRIGGERED_BUILD_NUMBER_" + sanitisedJobName, buildNumberStr);
+        
+        //Set EnvVar "TRIGGERED_JOB_NAMES" to previous value of "TRIGGERED_JOB_NAMES" + ,jobName.
+        String buildJobNames = env.get("TRIGGERED_JOB_NAMES");
+        String updatedBuildJobNames;
+        if ( buildJobNames == null ) { 
+            updatedBuildJobNames = jobName;
+        } else {
+            updatedBuildJobNames = buildJobNames + "," + jobName;
+        }
+        
+        remoteBuildEnvVars.put("TRIGGERED_JOB_NAMES", updatedBuildJobNames );        
+        
+        //Set EnvVar "TRIGGERED_BUILD_NUMBERS_project name>" to previousValue +1".
+        String triggedBuildNumbers = env.get("TRIGGERED_JOB_NAMES");
+        String updatedTriggeredBuildNumbers;
+        if ( triggedBuildNumbers == null ) { 
+            updatedTriggeredBuildNumbers = buildNumberStr;
+        } else {
+            updatedTriggeredBuildNumbers = triggedBuildNumbers + "," + buildNumberStr;
+        }
+        
+        remoteBuildEnvVars.put("TRIGGERED_BUILD_NUMBERS_" + sanitisedJobName, updatedTriggeredBuildNumbers );
+        
+        //Set EnvVar "TRIGGERED_BUILD_NUMBERS_<project name>" to returned BuildStatus
+        remoteBuildEnvVars.put("TRIGGERED_BUILD_RESULT_" + sanitisedJobName, buildStatusStr);
+        
+        //Set EnvVar "TRIGGERED_BUILD_NUMBERS_<project name>" to returned BuildStatus
+        remoteBuildEnvVars.put("TRIGGERED_BUILD_RESULT_" + sanitisedJobName + "_RUN_" + buildNumberStr, buildStatusStr);
+
+        //Set EnvVar "TRIGGERED_BUILD_RUN_COUNT_project name>" to previousValue +1.
+        String previousRunCountStr = env.get("TRIGGERED_BUILD_RUN_COUNT_" + sanitisedJobName );
+        int previousRunCount;
+        if ( previousRunCountStr == null ) { 
+            previousRunCount = 0;
+        } else {
+            previousRunCount = Integer.parseInt( previousRunCountStr );
+        }
+        previousRunCount++;
+        
+        remoteBuildEnvVars.put( "TRIGGERED_BUILD_RUN_COUNT_" + sanitisedJobName, Integer.toString(previousRunCount) );
+        
+        //Debug Messaging:
+        //listener.getLogger().println("Setting: " + "'LAST_TRIGGERED_JOB_NAME'" + ", to '" + jobName + "'");
+        //listener.getLogger().println("Setting: " + "'TRIGGERED_JOB_NAMES" + "', to '" + updatedBuildJobNames + "'");
+        //listener.getLogger().println("Setting: " + "'TRIGGERED_BUILD_NUMBERS_" + sanitisedJobName + "', to '" + updatedBuildJobNames + "'");
+        //listener.getLogger().println("Setting: " + "'TRIGGERED_BUILD_RESULT_" + sanitisedJobName + "', to '" + updatedBuildJobNames + "'");
+        //listener.getLogger().println("Setting: " + "'TRIGGERED_BUILD_RESULT_" + sanitisedJobName + "_RUN_" + buildNumberStr + "', to '" + buildStatusStr + "'");
+        //listener.getLogger().println("Setting: " + "'TRIGGERED_BUILD_RUN_COUNT_" + sanitisedJobName + "', to '" + Integer.toString(previousRunCount) + "'");
+        return remoteBuildEnvVars;
     }
 
     public String getBuildStatus(String buildUrlString, AbstractBuild build, BuildListener listener) throws IOException {
@@ -651,6 +747,12 @@ public class RemoteBuildConfiguration extends Builder {
     }
 
     public JSONObject sendHTTPCall(String urlString, String requestType, AbstractBuild build, BuildListener listener)
+            throws IOException {
+        
+            return sendHTTPCall( urlString, requestType, build, listener, 1 );
+    }
+
+    public JSONObject sendHTTPCall(String urlString, String requestType, AbstractBuild build, BuildListener listener, int NumberOfAttempts)
             throws IOException {
         RemoteJenkinsServer remoteServer = this.findRemoteHost(this.getRemoteJenkinsName());
 
@@ -715,8 +817,18 @@ public class RemoteBuildConfiguration extends Builder {
             }
 
         } catch (IOException e) {
+            //If we have ConnectionRetryLimit set to > 0 then retry that many times.
+            if ( NumberOfAttempts <= this.getConnectionRetryLimit() ) {
+                String strNumberOfRetries = Integer.toString(NumberOfAttempts);
+                String strConnectionRetryLimit = Integer.toString(this.getConnectionRetryLimit() );
+                        
+                listener.getLogger().println("Connection to remote server failed, retrying (attempt  " + strNumberOfRetries + " out of " + strConnectionRetryLimit + ")");
+                responseObject = sendHTTPCall(urlString, requestType, build, listener, NumberOfAttempts+1);
+            }
             // something failed with the connection, so throw an exception to mark the build as failed.
-            this.failBuild(e, listener);
+            else {
+                this.failBuild(e, listener);
+            }
         } catch (MacroEvaluationException e) {
             this.failBuild(e, listener);
         } catch (InterruptedException e) {
@@ -779,6 +891,10 @@ public class RemoteBuildConfiguration extends Builder {
         return this.pollInterval;
     }
 
+    public int getConnectionRetryLimit() {
+        return this.connectionRetryLimit;
+    }
+        
     public String getToken() {
         return this.token;
     }
